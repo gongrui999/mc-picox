@@ -1,0 +1,16 @@
+data/
+pico_span/
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.ckpt
+checkpoint-*/
+.ipynb_checkpoints/
+.cache/
+missed_spans_full.json
+short_missed_analysis.json
+.env
+*.xlsx
+wandb/
+runs/
