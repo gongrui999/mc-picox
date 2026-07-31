@@ -87,10 +87,22 @@ python -c "import torch; print(torch.__version__); print(torch.cuda.is_available
 
 ## Dataset
 
-Download and extract
-[EBM-NLP 2.00](https://github.com/bepnye/EBM-NLP). The directory passed to
-`--ebm_nlp_dir` must contain the extracted `documents` and `annotations`
-folders.
+The official [EBM-NLP repository](https://github.com/bepnye/EBM-NLP) is
+included as a Git submodule under `datasets/EBM-NLP`. Clone MC-PICOX with:
+
+```bash
+git clone --recurse-submodules https://github.com/gongrui999/mc-picox.git
+```
+
+For an existing clone, initialize the dataset submodule with:
+
+```bash
+git submodule update --init --recursive
+```
+
+Extract `datasets/EBM-NLP/ebm_nlp_2_00.tar.gz` into `data/raw/`. The directory
+passed to `--ebm_nlp_dir` must contain the extracted `documents` and
+`annotations` folders.
 
 Recommended local layout:
 
@@ -103,7 +115,7 @@ data/
     └── json/
 ```
 
-The dataset and generated artifacts are not included in this repository.
+Generated data and model artifacts remain excluded from Git.
 
 ## Running the Pipeline
 

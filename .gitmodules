@@ -1,0 +1,3 @@
+[submodule "datasets/EBM-NLP"]
+	path = datasets/EBM-NLP
+	url = https://github.com/bepnye/EBM-NLP.git
