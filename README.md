@@ -52,6 +52,10 @@ then performs independent P/I/O classification with sigmoid outputs.
 ├── analyze_missed_spans.py               # Missed-span statistics
 ├── analyze_short_missed.py               # Short-span error analysis
 ├── analyze_chinese_dataset.py            # Chinese recommendation analysis
+├── datasets/
+│   ├── EBM-NLP/                           # Official EBM-NLP Git submodule
+│   └── CCG-PICO/
+│       └── ccg_pico_recommendations.xlsx  # Chinese guideline recommendations
 ├── requirements.txt
 └── README.md
 ```
@@ -116,6 +120,19 @@ data/
 ```
 
 Generated data and model artifacts remain excluded from Git.
+
+### Chinese CCG-PICO Data
+
+The project-provided Chinese recommendation dataset is available at:
+
+```text
+datasets/CCG-PICO/ccg_pico_recommendations.xlsx
+```
+
+It contains structured guideline fields and normalized recommendation text.
+Because structured values may be paraphrased in the text, they require
+alignment and manual span-boundary review before strict PICO training or
+evaluation. See `datasets/CCG-PICO/README.md` for details.
 
 ## Running the Pipeline
 
