@@ -1,35 +1,20 @@
-"""
-Step 2-2: End-to-end PICO span extraction (boundary + span classification).
-
-Loads boundary predictions from Step 1-2 and a trained span classifier from
-Step 2-1. For each sentence, enumerates candidate spans from predicted
-boundaries, classifies each candidate, and applies NMS to remove duplicates.
-
-Usage:
-    python step_2_2_span_clf.py \
-        --base_model microsoft/BiomedNLP-PubMedBERT-large-uncased-abstract \
-        --span_clf_model_path pico_span/span_clf/<model_name> \
-        --input_folder data/bioc/json/step_1_boundary_pred \
-        --output_path data/bioc/json/step_2_span_clf \
-        --split test \
-        --threshold 0.5
-"""
+"""Classify boundary candidates and apply deterministic class-wise confidence NMS."""
 
 import argparse
 import json
-import os
+from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
-import numpy as np
 import torch
-from datasets import load_dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+from pipeline_utils import (
+    PICO_CLASSES, checkpoint_fingerprint, encode_windows, experiment_manifest, max_sequence_length, read_jsonl,
+    sentence_id, write_json, write_jsonl,
+)
 
-# ---------------------------------------------------------------------------
-# Enums & Constants
-# ---------------------------------------------------------------------------
 
 class DatasetSplit(Enum):
     train = 0
@@ -37,29 +22,10 @@ class DatasetSplit(Enum):
     test = 2
 
 
-class PicoType(Enum):
-    PARTICIPANTS = 4
-    INTERVENTIONS = 2
-    OUTCOMES = 1
-
-
-PICO_CLASSES = ["PARTICIPANTS", "INTERVENTIONS", "OUTCOMES"]
-
-
-# ---------------------------------------------------------------------------
-# Span helpers
-# ---------------------------------------------------------------------------
-
+@dataclass(frozen=True)
 class Span:
-    def __init__(self, start, length):
-        self.start = start
-        self.length = length
-
-    def __repr__(self):
-        return f"Span(start={self.start}, length={self.length})"
-
-    def __eq__(self, other):
-        return (self.start, int(self.length)) == (other.start, int(other.length))
+    start: int
+    length: int
 
 
 def extract_span_boundaries(boundary_pred):
@@ -68,167 +34,150 @@ def extract_span_boundaries(boundary_pred):
     return [(s, e) for s in starts for e in ends if s <= e]
 
 
-def text_span_iou(a: Span, b: Span) -> float:
-    a_start, a_end = a.start, a.start + a.length
-    b_start, b_end = b.start, b.start + b.length
-    u = max(a_end, b_end) - min(a_start, b_start)
-    if u == 0.0:
-        return 0.0
-    i = 0.0
-    if a_start <= b_end and b_start <= a_end:
-        i = min(a_end, b_end) - max(a_start, b_start)
-    return i / u
+def text_span_iou(a, b):
+    intersection = max(0, min(a.start + a.length, b.start + b.length) - max(a.start, b.start))
+    union = a.length + b.length - intersection
+    return intersection / union if union else 0.0
 
 
 def nms_span(spans, span_class, confidence, iou_threshold=0.0):
-    keep = [True] * len(spans)
-    for i in range(len(spans) - 1):
-        if not keep[i]:
+    if not len(spans) == len(span_class) == len(confidence) or not 0 <= iou_threshold <= 1:
+        raise ValueError("Invalid NMS inputs")
+    order = sorted(range(len(spans)),
+                   key=lambda i: (-confidence[i], spans[i].start, -spans[i].length, span_class[i]))
+    keep = []
+    for i in order:
+        if any(span_class[i] == span_class[j] and (
+            spans[i] == spans[j] or text_span_iou(spans[i], spans[j]) > iou_threshold
+        ) for j in keep):
             continue
-        for j in range(i + 1, len(spans)):
-            if not keep[j] or span_class[i] != span_class[j]:
-                continue
-            iou = text_span_iou(spans[i], spans[j])
-            if iou > iou_threshold:
-                if spans[i].length > spans[j].length:
-                    keep[i] = False
-                else:
-                    keep[j] = False
-
-    return (
-        [s for s, k in zip(spans, keep) if k],
-        [c for c, k in zip(span_class, keep) if k],
-        [c for c, k in zip(confidence, keep) if k],
-    )
+        keep.append(i)
+    return ([spans[i] for i in keep], [span_class[i] for i in keep], [confidence[i] for i in keep])
 
 
-# ---------------------------------------------------------------------------
-# PICO element extraction
-# ---------------------------------------------------------------------------
-
-def extract_pico_elements_util(tokens, boundary_pred, tokenizer, model,
-                               device, threshold=0.5):
-    candidate_spans = extract_span_boundaries(boundary_pred)
-    spans, pico_class, confidence = [], [], []
-
-    for start, end in candidate_spans:
-        content = tokens[start: end + 1]
-        x = tokenizer(content, padding=True, return_tensors="pt", is_split_into_words=True)
-        x = {k: v.to(device) for k, v in x.items()}
-
-        with torch.no_grad():
-            y = model(**x)
-
-        probability = np.squeeze(
-            torch.nn.functional.sigmoid(y.logits).cpu().numpy()
-        ).tolist()
-
-        if isinstance(probability, float):
-            probability = [probability]
-
-        for i, p in enumerate(probability):
-            if p < threshold:
-                continue
-            pico_class.append(model.config.id2label[i])
-            confidence.append(p)
-            spans.append(Span(start=start, length=len(content)))
-
-    return nms_span(spans, pico_class, confidence)
+def score_candidates(tokens, candidates, tokenizer, model, device, max_length=None, stride=64):
+    """Cache all class scores; overlong spans use a disclosed mean across windows."""
+    limit = max_sequence_length(tokenizer, model.config, max_length)
+    classes = [model.config.id2label[i] for i in range(model.config.num_labels)]
+    if set(classes) != set(PICO_CLASSES):
+        raise ValueError("Span checkpoint must define PARTICIPANTS/INTERVENTIONS/OUTCOMES labels")
+    scored = {}
+    for start, end in sorted(set(candidates)):
+        encoded = encode_windows(tokenizer, tokens[start:end + 1], limit, stride, tensors="pt")
+        scores = []
+        for i in range(len(encoded["input_ids"])):
+            inputs = {k: encoded[k][i:i + 1].to(device)
+                      for k in tokenizer.model_input_names if k in encoded}
+            with torch.no_grad():
+                scores.append(model(**inputs).logits[0].float().sigmoid())
+        average = torch.stack(scores).mean(0)
+        if not torch.isfinite(average).all():
+            raise ValueError("Span model emitted non-finite probabilities")
+        probability = average.cpu().tolist()
+        scored[(start, end)] = dict(zip(classes, probability))
+    return scored
 
 
-def extract_pico_elements(dataset_dict, dataset_split, output_path,
-                          model, tokenizer, device, threshold=0.5):
-    output_file = os.path.join(output_path, f"{dataset_split.name}_pico_spans.json")
-    os.makedirs(output_path, exist_ok=True)
-
-    dataset = dataset_dict[dataset_split.name]
-
-    with open(output_file, "w+", encoding="utf-8") as fout:
-        for i in tqdm(range(len(dataset)), desc=f"Span classification ({dataset_split.name})"):
-            row = {
-                "pmid": dataset["pmid"][i],
-                "tokens": dataset["tokens"][i],
-                "original_labels": dataset["original_labels"][i],
-                "boundary_pred": dataset["boundary_pred"][i],
-            }
-            start_confidence = dataset["start_confidence"][i]
-            end_confidence = dataset["end_confidence"][i]
-
-            spans, pico_cls, conf = extract_pico_elements_util(
-                row["tokens"], row["boundary_pred"],
-                tokenizer, model, device,
-                threshold=threshold,
-            )
-
-            row["pico_elements"] = {}
-            for s, c, cf in zip(spans, pico_cls, conf):
-                if c not in row["pico_elements"]:
-                    row["pico_elements"][c] = []
-                span_dict = {
-                    "span_start": s.start,
-                    "span_length": s.length,
-                    "confidence": cf,
-                }
-                row["pico_elements"][c].append(span_dict)
-                row["start_confidence"] = start_confidence[s.start]
-                row["end_confidence"] = end_confidence[s.start + s.length - 1]
-
-            fout.write(f"{json.dumps(row)}\n")
-
-    print(f"Saved PICO span predictions to {output_file}")
+def filter_scored_candidates(scored, threshold=0.5, iou_threshold=0.0):
+    if not 0 <= threshold <= 1:
+        raise ValueError("Classification threshold must be in [0,1]")
+    spans, classes, scores = [], [], []
+    for (start, end), probabilities in scored.items():
+        for label, score in probabilities.items():
+            if score >= threshold:
+                spans.append(Span(start, end - start + 1))
+                classes.append(label)
+                scores.append(score)
+    return nms_span(spans, classes, scores, iou_threshold)
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+def extract_pico_elements_util(tokens, boundary_pred, tokenizer, model, device,
+                               threshold=0.5, iou_threshold=0.0, max_length=None, stride=64):
+    return filter_scored_candidates(score_candidates(
+        tokens, extract_span_boundaries(boundary_pred), tokenizer, model, device, max_length, stride
+    ), threshold, iou_threshold)
+
+
+def build_prediction_row(original, spans, classes, confidence, index=0):
+    row = dict(original)
+    row["sentence_id"] = sentence_id(original, index)
+    n = len(row["tokens"])
+    for key in ("start_confidence", "end_confidence"):
+        if not isinstance(row.get(key), list) or len(row[key]) != n:
+            raise ValueError(f"{key} must be a per-word list")
+    elements = {}
+    for span, label, score in zip(spans, classes, confidence):
+        elements.setdefault(label, []).append({
+            "span_start": span.start, "span_length": span.length, "confidence": score,
+            "start_confidence": row["start_confidence"][span.start],
+            "end_confidence": row["end_confidence"][span.start + span.length - 1],
+        })
+    row["pico_elements"] = elements
+    return row
+
+
+def extract_pico_elements(dataset_dict, dataset_split, output_path, model, tokenizer,
+                          device, threshold=0.5, iou_threshold=0.0, max_length=None, stride=64):
+    rows = []
+    for i, original in enumerate(tqdm(dataset_dict[dataset_split.name], desc="Span classification")):
+        spans, labels, confidence = extract_pico_elements_util(
+            original["tokens"], original["boundary_pred"], tokenizer, model, device,
+            threshold, iou_threshold, max_length, stride,
+        )
+        rows.append(build_prediction_row(original, spans, labels, confidence, i))
+    output = Path(output_path) / f"{dataset_split.name}_pico_spans.json"
+    write_jsonl(output, rows)
+    return output
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Step 2-2: End-to-end span extraction")
-    parser.add_argument("--base_model", type=str,
-                        default="microsoft/BiomedNLP-PubMedBERT-large-uncased-abstract")
-    parser.add_argument("--span_clf_model_path", type=str, required=True,
-                        help="Path to the trained span classifier checkpoint")
-    parser.add_argument("--input_folder", type=str,
-                        default="data/bioc/json/step_1_boundary_pred")
-    parser.add_argument("--input_file", type=str, default=None,
-                        help="Override input JSONL file (default: <split>_boundary_pred.json)")
-    parser.add_argument("--output_path", type=str, default="data/bioc/json/step_2_span_clf")
-    parser.add_argument("--split", type=str, default="test",
-                        choices=["train", "validation", "test"])
-    parser.add_argument("--threshold", type=float, default=0.5,
-                        help="Span classification probability threshold")
-    parser.add_argument("--device", type=str, default=None)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--span_clf_model_path", required=True)
+    parser.add_argument("--input_folder", default="data/bioc/json/step_1_boundary_pred")
+    parser.add_argument("--input_file", default=None)
+    parser.add_argument("--output_path", default="data/bioc/json/step_2_span_clf")
+    parser.add_argument("--split", choices=["train", "validation", "test"], default="test")
+    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--threshold_config", default=None)
+    parser.add_argument("--nms_iou_threshold", type=float, default=0.0)
+    parser.add_argument("--max_length", type=int, default=None)
+    parser.add_argument("--stride", type=int, default=64)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--base_model", default=None, help="Legacy tokenizer override; prefer checkpoint tokenizer")
     args = parser.parse_args()
-
+    if args.threshold_config:
+        calibration = json.loads(Path(args.threshold_config).read_text(encoding="utf-8"))
+        if calibration.get("split") != "validation":
+            raise ValueError("Threshold config must originate from validation")
+        if calibration.get("span_checkpoint_sha256") != checkpoint_fingerprint(args.span_clf_model_path):
+            raise ValueError("Span checkpoint changed after calibration")
+        args.threshold = calibration["classification_threshold"]
+        args.nms_iou_threshold = calibration["nms_iou_threshold"]
+        args.max_length = calibration["span_max_length"]
+        args.stride = calibration["span_stride"]
+        if args.base_model:
+            raise ValueError("A calibrated run must use the saved checkpoint tokenizer")
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-
-    # ---- Load model ----
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
-    model = AutoModelForSequenceClassification.from_pretrained(args.span_clf_model_path)
-    model.to(device)
-    model.eval()
-
-    # ---- Load boundary prediction data ----
-    input_file = args.input_file or os.path.join(
-        args.input_folder, f"{args.split}_boundary_pred.json"
+    model = AutoModelForSequenceClassification.from_pretrained(args.span_clf_model_path).to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model or args.span_clf_model_path, use_fast=True)
+    source = Path(args.input_file or Path(args.input_folder) / f"{args.split}_boundary_pred.json")
+    if args.threshold_config:
+        metadata = json.loads(Path(str(source) + ".manifest.json").read_text(encoding="utf-8"))
+        for key in ("boundary_checkpoint_sha256", "start_threshold", "end_threshold",
+                    "decode_rule", "max_length", "stride"):
+            if metadata.get(key) != calibration.get(key):
+                raise ValueError(f"Boundary probabilities do not match calibrated setting {key}")
+    output = extract_pico_elements(
+        {args.split: read_jsonl(source)}, DatasetSplit[args.split], args.output_path,
+        model, tokenizer, device, args.threshold, args.nms_iou_threshold,
+        args.max_length, args.stride,
     )
-    ebm_nlp = load_dataset(
-        "json",
-        data_files={
-            "train": input_file,
-            "validation": input_file,
-            "test": input_file,
-        },
-    )
-    print(ebm_nlp)
-
-    split_enum = DatasetSplit[args.split]
-    extract_pico_elements(
-        ebm_nlp, split_enum, args.output_path, model, tokenizer, device,
-        threshold=args.threshold,
-    )
-
-    print("Done.")
+    write_json(str(output) + ".manifest.json", experiment_manifest(
+        args, [source], span_model_path=str(Path(args.span_clf_model_path).resolve()),
+        classification_threshold=args.threshold, nms_iou_threshold=args.nms_iou_threshold,
+        long_span_policy="mean of per-window sigmoid scores", classification_comparison=">=",
+    ))
+    print(f"Saved predictions to {output}")
 
 
 if __name__ == "__main__":

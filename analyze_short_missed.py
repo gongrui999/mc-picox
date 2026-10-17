@@ -7,10 +7,12 @@ Deep analysis of missed short spans (1-3 tokens):
 """
 
 import json
+import argparse
 import re
 import os
 from collections import defaultdict, Counter
 from enum import Enum
+from pipeline_utils import file_sha256, gold_spans as canonical_gold_spans, sentence_id
 
 
 class PicoType(Enum):
@@ -86,14 +88,29 @@ def categorize_span(text):
 
 
 def main():
-    missed_path = r"D:\PICOX\PICOX\missed_spans_full.json"
-    train_path = r"D:\PICOX\PICOX\data\bioc\json\train.json"
-    pred_path = r"D:\PICOX\PICOX\data\bioc\json\step_2_span_clf\test_pico_spans.json"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--missed_path", default="missed_spans_full.json")
+    parser.add_argument("--train_path", default="data/bioc/json/train.json")
+    parser.add_argument("--pred_path", default="data/bioc/json/step_2_span_clf/test_pico_spans.json")
+    parser.add_argument("--output_path", default="short_missed_analysis.json")
+    args = parser.parse_args()
+    missed_path, train_path, pred_path = args.missed_path, args.train_path, args.pred_path
+    if os.path.exists(missed_path + ".manifest.json"):
+        with open(missed_path + ".manifest.json", encoding="utf-8") as stream:
+            expected = json.load(stream)["prediction_sha256"]
+        if expected != file_sha256(pred_path):
+            raise ValueError("Prediction file changed: regenerate missed spans")
 
     with open(missed_path, "r", encoding="utf-8") as f:
         all_missed = json.load(f)
 
     short_missed = [m for m in all_missed if m["span_length"] <= 3]
+    if not short_missed:
+        os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
+        with open(args.output_path, "w", encoding="utf-8") as stream:
+            json.dump({"total_short_missed": 0, "boundary_nearby": {"yes": 0, "no": 0}}, stream)
+        print("No short zero-overlap misses")
+        return
     print(f"Total missed spans: {len(all_missed)}")
     print(f"Short missed spans (1-3 tokens): {len(short_missed)}")
     print()
@@ -106,7 +123,9 @@ def main():
         tokens = row["tokens"]
         labels = row["labels"]
         for pt in PicoType:
-            for start, length in extract_spans_from_labels(labels, pt.value):
+            for label, start, length in canonical_gold_spans(row):
+                if label != pt.name:
+                    continue
                 if length <= 3:
                     text = " ".join(tokens[start:start + length]).lower()
                     train_span_texts[text].add(pt.name)
@@ -197,15 +216,19 @@ def main():
     print("=" * 70)
     pred_data = load_jsonl(pred_path)
     pred_by_pmid = {}
-    for row in pred_data:
-        key = (row["pmid"], len(row["tokens"]))
+    for row_index, row in enumerate(pred_data):
+        key = sentence_id(row, row_index)
+        if key in pred_by_pmid:
+            raise ValueError("Duplicate sentence_id in predictions")
         pred_by_pmid[key] = row.get("boundary_pred", [])
 
     near_boundary = 0
     no_near_boundary = 0
     for m in short_missed:
-        key = (m["pmid"], m["sentence_tokens"])
-        bp = pred_by_pmid.get(key, [])
+        key = m.get("sentence_id")
+        if key not in pred_by_pmid:
+            raise ValueError("Missing/stale sentence_id: regenerate misses from this prediction file")
+        bp = pred_by_pmid[key]
         if not bp:
             no_near_boundary += 1
             continue
@@ -240,7 +263,8 @@ def main():
         },
         "top_missed_texts": text_type_counter.most_common(100),
     }
-    out_path = r"D:\PICOX\PICOX\short_missed_analysis.json"
+    out_path = args.output_path
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(output, f, ensure_ascii=False, indent=2)
     print(f"\nDetailed results saved to: {out_path}")

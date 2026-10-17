@@ -1,301 +1,230 @@
 # MC-PICOX
 
-**Multi-Channel PICO Extraction for Overlapping Biomedical Entities**
+A two-stage span extractor for overlapping Participants, Interventions and Outcomes.
+The maintained implementation is the Python pipeline. The original notebooks are
+historical reference material.
 
-MC-PICOX is a Python implementation of a two-stage, span-based PICO extraction
-pipeline. It extends PICOX with a multi-channel gated boundary detector for
-extracting overlapping **Participants (P)**, **Interventions (I)**, and
-**Outcomes (O)** from randomized controlled trial text.
+The boundary model provides point, convolutional-window and CLS channels with
+token-wise softmax gating. It supports cross-entropy and class-weighted focal
+loss, separate validation-selected start/end thresholds, and a multilabel span
+classifier with confidence-based class-wise NMS.
 
-The pipeline first localizes type-independent span boundaries and then applies a
-multi-label span classifier. Separating localization from entity typing allows
-the model to represent overlapping PICO entities.
+**Implementation status:** the repaired pipeline has offline regression and
+end-to-end smoke tests. Full EBM-NLP/CCG-PICO benchmark reruns are still required;
+this revision does not claim to have reproduced the paper's reported F1 values.
+See [repair status](docs/REVIEW_FIXES.md) and
+[experiment protocol](docs/REPRODUCIBILITY.md).
 
-## Highlights
+## Installation and checks
 
-- End-to-end Python scripts; Jupyter is not required.
-- Baseline and multi-channel boundary detectors.
-- Point, local-window, and sentence-level feature channels.
-- Token-wise softmax gating for adaptive feature fusion.
-- Multi-label P/I/O span classification.
-- Strict span-level precision, recall, and F1 evaluation.
-- Utilities for missed-span and Chinese dataset analysis.
+The captured environment uses Python 3.13.3, PyTorch 2.10.0 and Transformers 5.3.0.
+Both direct dependencies and their captured dependency closure are version-pinned.
 
-## Architecture
+For CPU testing:
 
-The multi-channel boundary detector uses a pretrained biomedical Transformer
-encoder and constructs three views for each token:
+~~~bash
+python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements-lock.txt
+python -m unittest discover -s tests -v
+~~~
 
-1. **Point channel**: the contextual representation of the current token.
-2. **Window channel**: local context encoded by a one-dimensional convolution.
-3. **Sentence channel**: the `[CLS]` representation broadcast to every token.
+For GPU training, install the corresponding PyTorch 2.10.0 CUDA wheel first.
+The lock records package versions, not a CUDA driver or hardware specification.
+GitHub Actions runs the offline tests on CPU; test models are created locally
+and do not download pretrained weights.
 
-A learned token-wise gate combines the three channels without increasing the
-final hidden dimension. The fused representation is classified into five
-boundary labels: `OUT`, `START`, `END`, `BOTH`, and `IN`.
+## Data and model contracts
 
-Predicted start/end positions form candidate spans. A second PubMedBERT model
-then performs independent P/I/O classification with sigmoid outputs.
+Run commands from the repository root. Files named *.json below are JSON Lines,
+one sentence/span per line.
 
-## Repository Structure
+Boundary input:
 
-```text
-.
-├── model.py                              # Multi-channel gated boundary model
-├── convert_ebm_nlp_to_bioc.py            # Raw EBM-NLP -> BioC XML
-├── step_0_preprocess.py                  # BioC XML -> JSONL datasets
-├── step_1_1_boundary_training.py         # Train boundary detector
-├── step_1_2_boundary_prediction.py       # Predict boundaries
-├── step_2_1_span_clf_training.py         # Train P/I/O span classifier
-├── step_2_2_span_clf.py                  # End-to-end span extraction
-├── step_3_evaluate.py                    # Strict span-level evaluation
-├── analyze_missed_spans.py               # Missed-span statistics
-├── analyze_short_missed.py               # Short-span error analysis
-├── analyze_chinese_dataset.py            # Chinese recommendation analysis
-├── datasets/
-│   ├── EBM-NLP/                           # Official EBM-NLP Git submodule
-│   └── CCG-PICO/
-│       └── ccg_pico_recommendations.xlsx  # Chinese guideline recommendations
-├── requirements.txt
-└── README.md
-```
+~~~json
+{"pmid":"doc-1","sentence_id":"doc-1:0:0","tokens":["Patients","improved"],"labels":[4,1]}
+~~~
 
-The original notebooks are retained as reference material. The `.py` scripts
-are recommended for reproducible training and inference.
+Token labels use P=4, I=2, O=1 as a bitmask. An optional gold_spans list contains
+objects with type, start and end, using token-index half-open intervals [start,end).
+Explicit spans take precedence over the bitmask and preserve adjacent or overlapping
+same-type gold spans. CCG uses original characters as tokens, preserving whitespace
+and character offsets. Whitespace discarded by a tokenizer receives zero boundary
+probability and is not mistaken for an uncovered word.
 
-## Requirements
+Span-classification input:
 
-- Python 3.10 or later
-- PyTorch
-- Hugging Face Transformers and Datasets
-- A CUDA-capable GPU is strongly recommended for PubMedBERT-large
+~~~json
+{"pmid":"doc-1","tokens":["Patients"],"PARTICIPANTS":true,"INTERVENTIONS":false,"OUTCOMES":false}
+~~~
 
-Create an environment:
+Identical gold boundaries are merged into one multilabel example. Crossed
+boundaries supply non-entity negatives.
 
-```bash
-conda create -n mc-picox python=3.10 -y
-conda activate mc-picox
-pip install -r requirements.txt
-pip install "accelerate>=1.1.0"
-```
+All training defaults use the same public PubMedBERT-base checkpoint. To use a
+large model or a Chinese encoder, pass its **actual model ID/revision or local
+checkpoint** to both training commands. Encoder size is read from its config
+and saved in the run manifest. A base run must not be described as the paper's
+large-model experiment.
 
-For GPU training, install the CUDA-compatible PyTorch build for your system
-from the [official PyTorch installation guide](https://pytorch.org/get-started/locally/)
-before installing the remaining requirements.
+## EBM-NLP preprocessing
 
-Verify the environment:
-
-```bash
-python -c "import torch; print(torch.__version__); print(torch.cuda.is_available())"
-```
-
-## Dataset
-
-The official [EBM-NLP repository](https://github.com/bepnye/EBM-NLP) is
-included as a Git submodule under `datasets/EBM-NLP`. Clone MC-PICOX with:
-
-```bash
-git clone --recurse-submodules https://github.com/gongrui999/mc-picox.git
-```
-
-For an existing clone, initialize the dataset submodule with:
-
-```bash
+~~~bash
 git submodule update --init --recursive
-```
-
-Extract `datasets/EBM-NLP/ebm_nlp_2_00.tar.gz` into `data/raw/`. The directory
-passed to `--ebm_nlp_dir` must contain the extracted `documents` and
-`annotations` folders.
-
-Recommended local layout:
-
-```text
-data/
-├── raw/
-│   └── ebm_nlp_2_00/
-└── bioc/
-    ├── input/
-    └── json/
-```
-
-Generated data and model artifacts remain excluded from Git.
-
-### Chinese CCG-PICO Data
-
-The project-provided Chinese recommendation dataset is available at:
-
-```text
-datasets/CCG-PICO/ccg_pico_recommendations.xlsx
-```
-
-It contains structured guideline fields and normalized recommendation text.
-Because structured values may be paraphrased in the text, they require
-alignment and manual span-boundary review before strict PICO training or
-evaluation. See `datasets/CCG-PICO/README.md` for details.
-
-## Running the Pipeline
-
-Run all commands from the directory containing the Python scripts.
-
-### 1. Convert EBM-NLP to BioC XML
-
-```bash
+python -m tarfile -e datasets/EBM-NLP/ebm_nlp_2_00.tar.gz data/raw
 python convert_ebm_nlp_to_bioc.py --ebm_nlp_dir data/raw/ebm_nlp_2_00 --output_file data/bioc/input/ebm_nlp_2_00_ssplit.xml
-```
-
-### 2. Create Training, Validation, and Test Files
-
-```bash
 python step_0_preprocess.py --input_file data/bioc/input/ebm_nlp_2_00_ssplit.xml --raw_dir data/raw/ebm_nlp_2_00 --output_path data/bioc/json --val_ratio 0.05 --seed 0
-```
+~~~
 
-This step creates:
+The official gold test PMIDs remain fixed. Non-test PMIDs are sorted and
+shuffled using a local seeded RNG. split_manifest.json records all IDs and
+source hashes. Reuse that partition with --split_manifest PATH when repeating
+an experiment. Newly generated partitions are not assumed to match historical
+paper runs.
 
-```text
-data/bioc/json/
-├── train.json
-├── validation.json
-├── test.json
-├── train_span_clf.json
-├── validation_span_clf.json
-├── test_span_clf.json
-├── no_overlap/
-└── overlap_only/
-```
+## Train the two models
 
-### 3. Train the Boundary Detector
+Default multichannel training uses focal loss with gamma=2 and weights
+(OUT, START, END, BOTH, IN)=(0.15,2,2,6,1):
 
-Multi-channel model:
+~~~bash
+python step_1_1_boundary_training.py --input_folder data/bioc/json --model_type multichannel --loss_type focal --epochs 8 --learning_rate 5e-5 --batch_size 8 --seed 0
+python step_2_1_span_clf_training.py --input_folder data/bioc/json --epochs 3 --learning_rate 2e-5 --batch_size 16 --seed 0
+~~~
 
-```bash
-python step_1_1_boundary_training.py --input_folder data/bioc/json --model_checkpoint microsoft/BiomedNLP-PubMedBERT-large-uncased-abstract --output_dir pico_span/boundary_models --model_type multichannel --epochs 8 --learning_rate 5e-5 --batch_size 8
-```
+Use --model_type baseline for the single-head CE baseline.
+Use --model_type multichannel --loss_type ce for the MC-only ablation.
+Both commands accept --model_checkpoint, --model_revision, --max_length,
+--stride and --use_cpu.
 
-Original single-head baseline:
+Boundary checkpoint selection defaults to boundary_recall: pooled start/end
+true positives divided by pooled gold start/end counts over labeled subwords,
+using argmax predictions. start_recall and end_recall remain explicit options.
+This checkpoint metric is distinct from the word-level, end-to-end validation
+objective used to calibrate thresholds.
 
-```bash
-python step_1_1_boundary_training.py --input_folder data/bioc/json --model_checkpoint microsoft/BiomedNLP-PubMedBERT-large-uncased-abstract --output_dir pico_span/boundary_models --model_type baseline --epochs 8 --learning_rate 5e-5 --batch_size 8
-```
+New multichannel models use the standard HF config.json and model.safetensors
+format and reload without downloading their encoder again. The boundary loader
+also accepts the original model_config.pt/model.pt format. Tokenizers load from
+the saved model directory.
 
-The trained model is saved under a timestamped directory:
+## Calibrate on validation, then evaluate test
 
-```text
-pico_span/boundary_models/boundaries-<model_type>-ebm_nlp-<timestamp>/
-```
+Replace BOUNDARY_MODEL_DIR and SPAN_MODEL_DIR with the output directories of
+the preceding commands. Use a new output path for each experimental condition.
 
-### 4. Predict Span Boundaries
+~~~bash
+python step_1_2_boundary_prediction.py --boundary_model_path BOUNDARY_MODEL_DIR --input_folder data/bioc/json --output_path data/bioc/json/boundaries --split validation
+python calibrate_thresholds.py --validation_predictions data/bioc/json/boundaries/validation_boundary_pred.json --span_clf_model_path SPAN_MODEL_DIR --output_file data/bioc/json/thresholds.json
+python step_1_2_boundary_prediction.py --boundary_model_path BOUNDARY_MODEL_DIR --input_folder data/bioc/json --output_path data/bioc/json/boundaries --split test --threshold_config data/bioc/json/thresholds.json
+python step_2_2_span_clf.py --span_clf_model_path SPAN_MODEL_DIR --input_folder data/bioc/json/boundaries --output_path data/bioc/json/predictions --split test --threshold_config data/bioc/json/thresholds.json
+python step_3_evaluate.py --input_folder data/bioc/json/predictions --pred_file test_pico_spans.json
+~~~
 
-Replace `<BOUNDARY_MODEL_DIR>` with the directory created in Step 3.
+Boundary evidence is q_start=p(START)+p(BOTH) and q_end=p(END)+p(BOTH).
+The decision uses q > threshold. Subword/window evidence is combined by max
+after summing the relevant classes; probabilities are not added across subwords.
 
-```bash
-python step_1_2_boundary_prediction.py --base_model microsoft/BiomedNLP-PubMedBERT-large-uncased-abstract --boundary_model_path <BOUNDARY_MODEL_DIR> --input_folder data/bioc/json --output_path data/bioc/json/step_1_boundary_pred --split test --threshold 0.25
-```
+Calibration checks that inputs are validation records, evaluates all 676 pairs
+from 0.05 to 0.30 in 0.01 steps, and maximizes strict end-to-end micro F1.
+It caches candidate class scores within the run. Ties favor higher recall,
+fewer candidates, then higher threshold sum/start/end. The frozen config stores
+model checksums, thresholds, tokenization settings and classification/NMS settings.
+Test inference checks those model checksums.
 
-Output:
+Without calibration, use --start_threshold and --end_threshold, or the shared
+--threshold convenience option. --decode_rule legacy_or preserves the historical
+OR rule for explicitly labeled legacy comparisons; sum is the default.
 
-```text
-data/bioc/json/step_1_boundary_pred/test_boundary_pred.json
-```
+Class predictions use score >= threshold. NMS operates within each category,
+orders by classification confidence and breaks ties by start then longer length.
+Exact duplicates are removed. --nms_iou_threshold controls overlap suppression;
+1.0 preserves distinct same-type overlaps. Fix this setting across compared
+conditions or select it using validation only.
 
-### 5. Train the Span Classifier
+## Long sequences
 
-```bash
-python step_2_1_span_clf_training.py --input_folder data/bioc/json --model_checkpoint microsoft/BiomedNLP-PubMedBERT-large-uncased-abstract --output_dir pico_span/span_clf --epochs 3 --learning_rate 2e-5 --batch_size 16
-```
+Training and inference use bounded overlapping tokenizer windows with global
+word IDs. The effective maximum comes from the encoder position limit, not an
+unbounded tokenizer sentinel. Overlap is clamped below the window content size.
+Boundary inference covers the full input, including its tail.
 
-The model is saved under:
+For a span longer than one classifier window, each window receives the span's
+multilabel targets during training; inference averages per-window sigmoid scores.
+This is an explicit fallback policy, recorded in manifests. It is not evidence
+of a measured long-span improvement.
 
-```text
-pico_span/span_clf/span-clf-PICO_NER-ebm_nlp_bioc-<timestamp>/
-```
+## Reviewed Chinese CCG-PICO annotations
 
-### 6. Extract PICO Spans
+The reviewed structured annotations are in
+datasets/CCG-PICO/ccg_pico_recommendations.xlsx. The source workbook is preserved.
 
-Replace `<SPAN_MODEL_DIR>` with the directory created in Step 5.
+~~~bash
+python prepare_ccg_pico.py export --output data/ccg/aligned_records.jsonl
+~~~
 
-```bash
-python step_2_2_span_clf.py --base_model microsoft/BiomedNLP-PubMedBERT-large-uncased-abstract --span_clf_model_path <SPAN_MODEL_DIR> --input_folder data/bioc/json/step_1_boundary_pred --output_path data/bioc/json/step_2_span_clf --split test --threshold 0.5
-```
+Export maps reviewed fields onto exact character offsets in Final, allowing
+whitespace normalization while preserving original coordinates. Repeated or
+unmatched fields are listed in the alignment report, not silently dropped or
+assigned guessed boundaries. Supply complete-record offsets in an overrides JSON,
+then rerun export with --overrides PATH. See the
+[CCG format and workflow](datasets/CCG-PICO/README.md).
 
-Output:
+Once every record has ready offsets:
 
-```text
-data/bioc/json/step_2_span_clf/test_pico_spans.json
-```
+~~~bash
+python prepare_ccg_pico.py build --records data/ccg/aligned_records.jsonl --output data/ccg/json --train_size 541 --validation_size 90 --test_size 90 --seed 0
+~~~
 
-### 7. Evaluate
+The builder preserves normalized template groups and chooses a seeded,
+label-balanced split with the requested sizes. It also accepts an existing
+verified --split_manifest. A newly generated split is not the missing original
+paper partition.
 
-```bash
-python step_3_evaluate.py --input_folder data/bioc/json/step_2_span_clf --pred_file test_pico_spans.json --confidence_threshold 0.5
-```
+The same train/calibrate/predict/evaluate commands work with --input_folder
+data/ccg/json and an actual compatible Chinese checkpoint. For PaddleNLP
+ERNIE-Health weights, see [conversion instructions](docs/ERNIE_HEALTH.md).
+The converter refuses incomplete mappings or failed tokenizer/encoder parity.
 
-The evaluator reports TP, FP, FN, precision, recall, and F1 for P, I, O, and
-the micro-aggregated overall result. A prediction is correct only when its
-entity type, start position, and length exactly match the gold span.
+## Three-shot Qwen baseline
 
-## Output and Model Directories
+The runner uses a user-specified OpenAI-compatible endpoint. It reads the API
+key from QWEN_API_KEY; no key belongs in a command, source file or Git commit.
+It makes no request during tests or module import.
 
-Training checkpoints and generated predictions can be large. They should
-normally be excluded from Git:
+~~~bash
+python run_qwen_baseline.py --train_file data/bioc/json/train.json --evaluation_file data/bioc/json/test.json --example_ids TRAIN_SENTENCE_1 TRAIN_SENTENCE_2 TRAIN_SENTENCE_3 --base_url https://YOUR_PROVIDER/v1 --model Qwen2.5-72B-Instruct --output_file data/qwen/test_predictions.jsonl
+python step_3_evaluate.py --pred_file data/qwen/test_predictions.jsonl
+~~~
 
-```gitignore
-data/
-pico_span/
-*.pt
-*.xlsx
-__pycache__/
-.cache/
-```
+Choose exactly three training sentence IDs. The runner rejects document overlap
+between training and evaluation, uses fixed demonstrations and temperature=0,
+and saves prompts, raw responses and parsing diagnostics. Repeated returned text
+maps to all exact token-aligned occurrences. For CCG use --joiner none.
+Provider model revisions and responses must be retained for a reported experiment;
+no Qwen benchmark has been run as part of this repair.
 
-Do not publish restricted clinical data, private API credentials, or local
-model caches.
+## Error analysis
 
-## Troubleshooting
+~~~bash
+python analyze_missed_spans.py --pred_path data/bioc/json/predictions/test_pico_spans.json --output_path data/analysis/missed.json
+python analyze_short_missed.py --missed_path data/analysis/missed.json --train_path data/bioc/json/train.json --pred_path data/bioc/json/predictions/test_pico_spans.json --output_path data/analysis/short.json
+python analyze_boundary_errors.py --pred_file data/bioc/json/predictions/test_pico_spans.json --output_file data/analysis/distance.json
+python analyze_chinese_dataset.py --input_file datasets/CCG-PICO/ccg_pico_recommendations.xlsx
+~~~
 
-### CUDA is not detected
+Sentence IDs replace the former PMID-plus-length lookup. A prediction checksum
+prevents mixing misses with changed predictions. The distance audit explicitly
+defines distance as the minimum max(start error,end error); use --mode
+boundary_pairs for type-independent candidate-pair auditing.
 
-```bash
-python -c "import torch; print(torch.cuda.is_available())"
-```
+## Repository artifacts and citation
 
-If this prints `False`, reinstall PyTorch using the CUDA build matching your
-driver.
+data/, pico_span/, caches, logs and local credentials are excluded from Git.
+The root ZIP/XML/JSON samples are retained for compatibility; they are not
+current experimental results. All new runs emit manifests and strict count-based
+metrics. Keep full-run artifacts with releases or an experiment archive.
 
-### Out-of-memory error
-
-Reduce `--batch_size`, use gradient accumulation, or replace PubMedBERT-large
-with a compatible base-size checkpoint. Keep the same checkpoint family for
-training and prediction.
-
-### Model loading mismatch
-
-Use the same Transformer checkpoint for boundary training and inference.
-Multi-channel checkpoints contain `model.pt` and `model_config.pt`; baseline
-models use the Hugging Face `save_pretrained` format.
-
-## Citation
-
-This implementation extends the PICOX framework. If you use it, please cite the
-original work:
-
-```bibtex
-@article{zhang2024picox,
-  title   = {A span-based model for extracting overlapping PICO entities from randomized controlled trial publications},
-  author  = {Zhang, G. and Zhou, Y. and Hu, Y. and Xu, H. and Weng, C. and Peng, Y.},
-  journal = {Journal of the American Medical Informatics Association},
-  volume  = {31},
-  number  = {5},
-  pages   = {1163--1171},
-  year    = {2024},
-  doi     = {10.1093/jamia/ocae065}
-}
-```
-
-Please also cite the MC-PICOX paper after its bibliographic information becomes
-available.
-
-## Acknowledgements
-
-MC-PICOX is built on the original PICOX pipeline and the EBM-NLP corpus. We
-thank their authors for releasing the code and data resources.
+This implementation extends the original PICOX work:
+[A span-based model for extracting overlapping PICO entities from randomized
+controlled trial publications](https://doi.org/10.1093/jamia/ocae065).
+The official corpus is [EBM-NLP](https://github.com/bepnye/EBM-NLP).

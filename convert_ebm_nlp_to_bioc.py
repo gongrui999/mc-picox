@@ -124,7 +124,7 @@ def get_pmid_split(ann_base, pico):
 def main():
     parser = argparse.ArgumentParser(description="Convert EBM-NLP to BioC XML")
     parser.add_argument("--ebm_nlp_dir", type=str,
-                        default=r"D:\PICOX\EBM-NLP\ebm_nlp_2_00\ebm_nlp_2_00",
+                        default="data/raw/ebm_nlp_2_00",
                         help="Path to extracted ebm_nlp_2_00 directory")
     parser.add_argument("--output_file", type=str,
                         default="data/bioc/input/ebm_nlp_2_00_ssplit.xml",
@@ -134,7 +134,7 @@ def main():
     doc_dir = os.path.join(args.ebm_nlp_dir, "documents")
     ann_base = os.path.join(args.ebm_nlp_dir, "annotations", "aggregated", "starting_spans")
 
-    os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+    os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
 
     # Collect all PMIDs that have annotations for ALL three PICO types
     p_pmids = get_pmid_split(ann_base, "participants")

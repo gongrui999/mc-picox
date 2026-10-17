@@ -14,3 +14,4 @@ short_missed_analysis.json
 *.xlsx
 wandb/
 runs/
+*.log

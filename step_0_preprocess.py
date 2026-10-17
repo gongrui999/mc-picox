@@ -24,6 +24,19 @@ from enum import Enum
 from typing import Any, List
 
 from bioc import biocxml
+from pipeline_utils import experiment_manifest, write_json
+
+
+def split_pmids(all_pmid, test_pmid, val_ratio=0.05, seed=0):
+    if not 0 < val_ratio < 1:
+        raise ValueError("val_ratio must be strictly between 0 and 1")
+    test = set(test_pmid) & set(all_pmid)
+    available = sorted(set(all_pmid) - test)
+    if len(available) < 2:
+        raise ValueError("At least two non-test documents are needed")
+    random.Random(seed).shuffle(available)
+    nval = min(len(available) - 1, max(1, int(round(val_ratio * len(available)))))
+    return set(available[nval:]), set(available[:nval]), test
 
 
 # ---------------------------------------------------------------------------
@@ -197,8 +210,8 @@ def create_dataset(
             pmid = document.id
             if pmid not in target_pmid_set:
                 continue
-            for passage in document.passages:
-                for sentence in passage.sentences:
+            for passage_index, passage in enumerate(document.passages):
+                for sentence_index, sentence in enumerate(passage.sentences):
                     tokens = extract_tokens(sentence)
                     participants = extract_pio_labels(sentence, PicoType.PARTICIPANTS)
                     interventions = extract_pio_labels(sentence, PicoType.INTERVENTIONS)
@@ -227,7 +240,9 @@ def create_dataset(
                             label |= PicoType.OUTCOMES.value
                         labels.append(label)
 
-                    data = {"pmid": pmid, "tokens": tokens, "labels": labels}
+                    data = {"pmid": pmid,
+                            "sentence_id": f"{pmid}:{passage_index}:{sentence_index}",
+                            "tokens": tokens, "labels": labels}
                     fout.write(f"{json.dumps(data)}\n")
 
     print(f"{dataset_split.name}: {overlap_count}/{total_count} sentences have overlapping spans.")
@@ -237,77 +252,59 @@ def create_dataset(
 # Dataset creation – span classification
 # ---------------------------------------------------------------------------
 
+def span_classification_examples(tokens, pico_spans, pmid, sample_limit=1):
+    """Merge identical gold boundaries into one truly multilabel training example."""
+    positives = defaultdict(set)
+    for pico_type, spans in pico_spans.items():
+        for span in spans:
+            positives[(int(span.start), int(span.end))].add(pico_type.name)
+    negatives = set()
+    kinds = list(PicoType)
+    for i, a in enumerate(kinds):
+        for b in kinds[i + 1:]:
+            for span in synthesize_spans(pico_spans[a], pico_spans[b]):
+                bounds = (int(span.start), int(span.end))
+                if bounds not in positives:
+                    negatives.add(bounds)
+    candidates = sorted(negatives)
+    random.shuffle(candidates)
+    selected = {**positives, **{bounds: set() for bounds in candidates[:sample_limit]}}
+    examples = []
+    for (start, end), labels in sorted(selected.items()):
+        if not 0 <= start < end <= len(tokens):
+            raise ValueError("Span classification example outside sentence")
+        examples.append({
+            "pmid": pmid, "tokens": tokens[start:end],
+            **{kind.name: kind.name in labels for kind in PicoType},
+        })
+    return examples
+
+
 def create_span_clf_dataset(
-    collection,
-    dataset_split: DatasetSplit,
-    output_path: str,
-    train_pmid: set,
-    validation_pmid: set,
-    test_pmid: set,
-    sample_limit: int = 1,
+    collection, dataset_split, output_path, train_pmid, validation_pmid, test_pmid,
+    sample_limit=1,
 ):
-    target_map = {
-        DatasetSplit.train: train_pmid,
-        DatasetSplit.validation: validation_pmid,
-        DatasetSplit.test: test_pmid,
-    }
+    target_map = {DatasetSplit.train: train_pmid, DatasetSplit.validation: validation_pmid,
+                  DatasetSplit.test: test_pmid}
     target_pmid_set = target_map[dataset_split]
-
-    output_file = os.path.join(output_path, f"{dataset_split.name}_span_clf.json")
     os.makedirs(output_path, exist_ok=True)
-
+    output_file = os.path.join(output_path, f"{dataset_split.name}_span_clf.json")
     count = defaultdict(int)
-
-    with open(output_file, "w+", encoding="utf-8") as fout:
+    with open(output_file, "w", encoding="utf-8") as stream:
         for document in collection.documents:
-            pmid = document.id
-            if pmid not in target_pmid_set:
+            if document.id not in target_pmid_set:
                 continue
             for passage in document.passages:
                 for sentence in passage.sentences:
-                    tokens = extract_tokens(sentence)
-                    pico_spans = {}
-                    for pico_type in list(PicoType):
-                        spans = extract_pico_spans(sentence, pico_type)
-                        pico_spans[pico_type] = spans
-                        for span in spans:
-                            start, end = int(span.start), int(span.start + span.length)
-                            data = {
-                                "pmid": pmid,
-                                "tokens": tokens[start:end],
-                                "PARTICIPANTS": False,
-                                "INTERVENTIONS": False,
-                                "OUTCOMES": False,
-                            }
-                            data[pico_type.name] = True
-                            fout.write(f"{json.dumps(data)}\n")
-                            count[pico_type.name] += 1
-
-                    synthesized = (
-                        synthesize_spans(pico_spans[PicoType.PARTICIPANTS], pico_spans[PicoType.INTERVENTIONS])
-                        + synthesize_spans(pico_spans[PicoType.PARTICIPANTS], pico_spans[PicoType.OUTCOMES])
-                        + synthesize_spans(pico_spans[PicoType.INTERVENTIONS], pico_spans[PicoType.OUTCOMES])
-                    )
-                    synthesized = list(set(synthesized))
-                    random.shuffle(synthesized)
-                    for span in synthesized[:sample_limit]:
-                        if all(
-                            span not in pico_spans[pt]
-                            for pt in PicoType
-                        ):
-                            start, end = int(span.start), int(span.start + span.length)
-                            data = {
-                                "pmid": pmid,
-                                "tokens": tokens[start:end],
-                                "PARTICIPANTS": False,
-                                "INTERVENTIONS": False,
-                                "OUTCOMES": False,
-                            }
-                            fout.write(f"{json.dumps(data)}\n")
-                            count["SYNTHESIZED"] += 1
-
-    stats = ", ".join(f"{k}: {count[k]}" for k in count)
-    print(f"{dataset_split.name}: {stats}")
+                    pico_spans = {kind: extract_pico_spans(sentence, kind) for kind in PicoType}
+                    for example in span_classification_examples(
+                        extract_tokens(sentence), pico_spans, document.id, sample_limit
+                    ):
+                        stream.write(json.dumps(example) + "\n")
+                        active = [kind.name for kind in PicoType if example[kind.name]]
+                        for label in active or ["SYNTHESIZED"]:
+                            count[label] += 1
+    print(f"{dataset_split.name}: {dict(count)}")
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +322,8 @@ def main():
     parser.add_argument("--val_ratio", type=float, default=0.05,
                         help="Fraction of training data for validation")
     parser.add_argument("--seed", type=int, default=0, help="Random seed")
+    parser.add_argument("--split_manifest", default=None,
+                        help="Reuse an existing manifest instead of creating a new partition")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -350,11 +349,27 @@ def main():
 
     # ---- Split ----
     all_pmid = set(doc.id for doc in collection.documents)
-    test_pmid = participants_test & interventions_test & outcomes_test
-    train_pmid_list = list(all_pmid - test_pmid)
-    boundary = int((1.0 - args.val_ratio) * len(train_pmid_list))
-    train_pmid = set(train_pmid_list[:boundary])
-    validation_pmid = set(train_pmid_list[boundary:])
+    official_test = participants_test & interventions_test & outcomes_test & all_pmid
+    if args.split_manifest:
+        with open(args.split_manifest, encoding="utf-8") as stream:
+            partition = json.load(stream)["splits"]
+        train_pmid, validation_pmid, test_pmid = (
+            set(partition[s]) for s in ("train", "validation", "test")
+        )
+        if (train_pmid & validation_pmid or train_pmid & test_pmid
+                or validation_pmid & test_pmid
+                or train_pmid | validation_pmid | test_pmid != all_pmid
+                or test_pmid != official_test):
+            raise ValueError("Manifest must partition this corpus and preserve official test PMIDs")
+    else:
+        train_pmid, validation_pmid, test_pmid = split_pmids(
+            all_pmid, official_test, args.val_ratio, args.seed
+        )
+    write_json(os.path.join(args.output_path, "split_manifest.json"), experiment_manifest(
+        args, [args.input_file],
+        splits={"train": sorted(train_pmid), "validation": sorted(validation_pmid),
+                "test": sorted(test_pmid)},
+    ))
 
     print(f"Total: {len(collection.documents)}, Train: {len(train_pmid)}, "
           f"Val: {len(validation_pmid)}, Test: {len(test_pmid)}")

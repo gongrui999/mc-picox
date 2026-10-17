@@ -5,10 +5,12 @@ and whether the boundary detector produced any boundary at all for the sentence.
 """
 
 import json
+import argparse
 import os
 import sys
 from enum import Enum
 from collections import defaultdict
+from pipeline_utils import file_sha256, gold_spans as canonical_gold_spans, sentence_id, write_json
 
 
 class PicoType(Enum):
@@ -56,7 +58,11 @@ def load_jsonl(path):
 
 
 def main():
-    pred_path = r"D:\PICOX\PICOX\data\bioc\json\step_2_span_clf\test_pico_spans.json"
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pred_path", default="data/bioc/json/step_2_span_clf/test_pico_spans.json")
+    parser.add_argument("--output_path", default="missed_spans_full.json")
+    args = parser.parse_args()
+    pred_path = args.pred_path
 
     if not os.path.exists(pred_path):
         print(f"File not found: {pred_path}")
@@ -73,7 +79,9 @@ def main():
     no_boundary_sentences = 0
     missed_in_no_boundary = 0
 
-    for row in data:
+    if not data:
+        raise ValueError("Prediction file is empty")
+    for row_index, row in enumerate(data):
         tokens = row["tokens"]
         original_labels = row["original_labels"]
         pico_elements = row.get("pico_elements", {})
@@ -85,7 +93,8 @@ def main():
             no_boundary_sentences += 1
 
         for pico_type in PicoType:
-            gold_spans = extract_spans_from_labels(original_labels, pico_type.value)
+            gold_spans = [Span(start, length) for label, start, length in canonical_gold_spans(row)
+                          if label == pico_type.name]
             if not gold_spans:
                 continue
 
@@ -120,6 +129,8 @@ def main():
 
                         all_missed.append({
                             "pmid": pmid,
+                            "sentence_id": sentence_id(row, row_index),
+                            "source_row": row_index,
                             "type": pico_type.name,
                             "span_text": span_text,
                             "span_length": gs.length,
@@ -133,9 +144,9 @@ def main():
     print(f"MISSED GOLD SPAN ANALYSIS (completely missed, zero overlap)")
     print("=" * 70)
     print(f"Total gold spans:   {total_gold}")
-    print(f"Completely missed:  {total_missed}  ({total_missed/total_gold*100:.1f}%)")
-    print(f"Sentences with 0 boundary predictions: {no_boundary_sentences}/{len(data)} ({no_boundary_sentences/len(data)*100:.1f}%)")
-    print(f"Missed spans in 0-boundary sentences:  {missed_in_no_boundary}/{total_missed} ({missed_in_no_boundary/total_missed*100:.1f}% of all missed)")
+    print(f"Completely missed:  {total_missed}  ({total_missed/max(1,total_gold)*100:.1f}%)")
+    print(f"Sentences with 0 boundary predictions: {no_boundary_sentences}/{len(data)} ({no_boundary_sentences/max(1,len(data))*100:.1f}%)")
+    print(f"Missed spans in 0-boundary sentences:  {missed_in_no_boundary}/{total_missed} ({missed_in_no_boundary/max(1,total_missed)*100:.1f}% of all missed)")
     print()
 
     print("-" * 70)
@@ -144,7 +155,7 @@ def main():
     for t in ["PARTICIPANTS", "INTERVENTIONS", "OUTCOMES"]:
         g = stats_by_type[t]["gold"]
         m = stats_by_type[t]["missed"]
-        print(f"  {t:<18} {g:>6} {m:>8} {m/g*100:>7.1f}%")
+        print(f"  {t:<18} {g:>6} {m:>8} {m/max(1,g)*100:>7.1f}%")
     print()
 
     print("-" * 70)
@@ -168,9 +179,11 @@ def main():
         print(f"\n[{i+1}] PMID={item['pmid']}  Type={item['type']}  Length={item['span_length']}  HasBoundary={bnd}")
         print(f"    {item['context']}")
 
-    output_path = r"D:\PICOX\PICOX\missed_spans_full.json"
+    output_path = args.output_path
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(all_missed, f, ensure_ascii=False, indent=2)
+    write_json(output_path + ".manifest.json", {"prediction_sha256": file_sha256(pred_path)})
     print(f"\n\nFull list saved to: {output_path} ({len(all_missed)} items)")
 
 
