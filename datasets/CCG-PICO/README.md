@@ -2,8 +2,12 @@
 
 The workbook contains 721 Chinese guideline records with reviewed structured P/I/O
 fields and their Final recommendation text. The original source file is preserved.
+Data preparation and full-model validation are in progress.
+
+<!--
 A field value and a strict entity offset are different representations: the workbook
 does not contain character start/end columns.
+-->
 
 ## Field mapping and exact offsets
 
@@ -22,12 +26,15 @@ python prepare_ccg_pico.py export --workbook datasets/CCG-PICO/ccg_pico_recommen
 Every aligned span retains its source field. Coordinates refer to original Final
 characters, use [start,end), and preserve the exact original substring. Whitespace
 normalization may help locate a value but never rewrites the source text.
+
+<!--
 Unmatched and repeated values are retained as unresolved issues with candidates.
 
 On the current source, 10 records uniquely align all mapped fields; 711 records
 have unresolved offsets. This is a conversion-status count, not a judgment that
 their structured annotations were not reviewed. The report includes each record
 ID, original value, reason and candidate positions.
+-->
 
 ## Supply complete-record overrides
 
@@ -63,7 +70,11 @@ The source workbook remains unchanged.
 python prepare_ccg_pico.py build --records data/ccg/aligned_records.jsonl --output data/ccg/json --train_size 541 --validation_size 90 --test_size 90 --seed 0
 ~~~
 
-Build refuses unresolved offsets. It creates boundary and multilabel span JSONL,
+<!--
+Build refuses unresolved offsets.
+-->
+
+Build creates boundary and multilabel span JSONL,
 retains explicit gold_spans, and saves all split record IDs and source hashes.
 
 The default template key masks aligned spans and numbers in normalized text;

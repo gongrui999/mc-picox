@@ -2,6 +2,7 @@
 
 数据拥有者确认 `datasets/CCG-PICO/ccg_pico_recommendations.xlsx` 的结构化字段
 已经人工审校。本次核查和转换没有改动该工作簿。
+中文数据准备与完整实验验证仍在进行。
 
 ## 已找到的来源
 
@@ -11,6 +12,7 @@
 SHA256: bee64d74423b024442e2e6470f84901331c45f84f61cacca42f96512b72e6a37
 ```
 
+<!--
 工作簿 Sheet1 有 721 条记录、23 列。它包含 Disease、Intervention_Name、
 Outcome_Indicator 等结构化字段以及 Recommendation、Final 文本，
 没有字符起止位置列。Sheet2、Sheet3 为空，未发现另藏标注的批注或自定义 XML。
@@ -38,3 +40,4 @@ Outcome_Indicator 等结构化字段以及 Recommendation、Final 文本，
 随后可通过 `prepare_ccg_pico.py build` 验证边界、保留显式重叠 span，生成固定
 训练/验证/测试文件。新划分会记录来源，不会被自动标记为论文原始划分。
 详见 [数据说明](../datasets/CCG-PICO/README.md)。
+-->

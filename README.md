@@ -162,12 +162,17 @@ datasets/CCG-PICO/ccg_pico_recommendations.xlsx. The source workbook is preserve
 python prepare_ccg_pico.py export --output data/ccg/aligned_records.jsonl
 ~~~
 
+Chinese data preparation and full-model validation are in progress. See the
+[CCG format and workflow](datasets/CCG-PICO/README.md).
+
+<!--
 Export maps reviewed fields onto exact character offsets in Final, allowing
 whitespace normalization while preserving original coordinates. Repeated or
 unmatched fields are listed in the alignment report, not silently dropped or
 assigned guessed boundaries. Supply complete-record offsets in an overrides JSON,
 then rerun export with --overrides PATH. See the
 [CCG format and workflow](datasets/CCG-PICO/README.md).
+-->
 
 Once every record has ready offsets:
 
